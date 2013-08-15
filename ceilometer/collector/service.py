@@ -22,6 +22,7 @@ import socket
 from stevedore import extension
 from stevedore import named
 
+from ceilometer.event import converter as event_converter
 from ceilometer.service import prepare_service
 from ceilometer.openstack.common import context
 from ceilometer.openstack.common.gettextutils import _
@@ -30,10 +31,8 @@ from ceilometer.openstack.common import service as os_service
 from ceilometer.openstack.common.rpc import dispatcher as rpc_dispatcher
 from ceilometer.openstack.common.rpc import service as rpc_service
 
-from ceilometer.openstack.common import timeutils
 from ceilometer import pipeline
 from ceilometer import storage
-from ceilometer.storage import models
 from ceilometer import transformer
 
 OPTS = [
@@ -130,6 +129,9 @@ class CollectorService(rpc_service.Service):
             ),
         )
 
+        LOG.debug('loading event definitions')
+        self.event_converter = event_converter.setup_events()
+
         LOG.debug('loading notification handlers from %s',
                   self.COLLECTOR_NAMESPACE)
         self.notification_manager = \
@@ -196,16 +198,6 @@ class CollectorService(rpc_service.Service):
         if cfg.CONF.collector.store_events:
             self._message_to_event(notification)
 
-    @staticmethod
-    def _extract_when(body):
-        """Extract the generated datetime from the notification.
-        """
-        when = body.get('timestamp', body.get('_context_timestamp'))
-        if when:
-            return timeutils.normalize_time(timeutils.parse_isotime(when))
-
-        return timeutils.utcnow()
-
     def _message_to_event(self, body):
         """Convert message to Ceilometer Event.
 
@@ -216,35 +208,19 @@ class CollectorService(rpc_service.Service):
         delivery_info, which is critical to determining the
         source of the notification. This will have to get added back later.
         """
-        event_name = body['event_type']
-        when = self._extract_when(body)
+        event = self.event_converter.to_event(body)
 
-        LOG.debug('Saving event "%s"', event_name)
+        if event is not None:
+            LOG.debug('Saving event "%s"', event.event_name)
 
-        message_id = body.get('message_id')
-
-        # TODO(sandy) - check we have not already saved this notification.
-        #               (possible on retries) Use message_id to spot dups.
-        publisher = body.get('publisher_id')
-        request_id = body.get('_context_request_id')
-        tenant_id = body.get('_context_tenant')
-
-        text = models.Trait.TEXT_TYPE
-        all_traits = [models.Trait('message_id', text, message_id),
-                      models.Trait('service', text, publisher),
-                      models.Trait('request_id', text, request_id),
-                      models.Trait('tenant_id', text, tenant_id),
-                      ]
-        # Only store non-None value traits ...
-        traits = [trait for trait in all_traits if trait.value is not None]
-
-        event = models.Event(event_name, when, traits)
-        try:
-            self.storage_conn.record_events([event, ])
-        except Exception as err:
-            LOG.exception(_("Unable to store events: %s"), err)
-            # By re-raising we avoid ack()'ing the message.
-            raise
+            # TODO(sandy) - check we have not already saved this event.
+            #               (possible on retries) Use message_id to spot dups.
+            try:
+                self.storage_conn.record_events([event, ])
+            except Exception as err:
+                LOG.exception(_("Unable to store events: %s"), err)
+                # By re-raising we avoid ack()'ing the message.
+                raise
 
     def _process_notification_for_ext(self, ext, notification):
         with self.pipeline_manager.publisher(context.get_admin_context()) as p:

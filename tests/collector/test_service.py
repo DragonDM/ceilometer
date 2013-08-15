@@ -18,7 +18,6 @@
 """Tests for ceilometer/agent/service.py
 """
 
-import datetime
 import msgpack
 import socket
 
@@ -29,7 +28,6 @@ from stevedore import extension
 from stevedore.tests import manager as test_manager
 
 from ceilometer import sample
-from ceilometer.openstack.common import timeutils
 from ceilometer.collector import service
 from ceilometer.storage import base
 from ceilometer.tests import base as tests_base
@@ -226,50 +224,16 @@ class TestCollectorService(TestCollector):
             self.srv.process_notification({})
             self.assertTrue(fake_msg_to_event.called)
 
-    def test_message_to_event_missing_keys(self):
-        now = timeutils.utcnow()
-        timeutils.set_time_override(now)
-        message = {'event_type': "foo", 'message_id': "abc"}
-
-        self.srv.storage_conn = MagicMock()
-
-        with patch('ceilometer.collector.service.LOG') as mylog:
-            self.srv._message_to_event(message)
-            self.assertFalse(mylog.exception.called)
-        events = self.srv.storage_conn.record_events.call_args[0]
-        self.assertEqual(1, len(events))
-        event = events[0][0]
-        self.assertEqual("foo", event.event_name)
-        self.assertEqual(now, event.generated)
-        self.assertEqual(1, len(event.traits))
-
     def test_message_to_event_bad_save(self):
         cfg.CONF.set_override("store_events", True, group="collector")
         self.srv.storage_conn = MagicMock()
         self.srv.storage_conn.record_events.side_effect = MyException("Boom")
+        self.srv.event_converter = MagicMock()
+        self.srv.event_converter.to_event.return_value = MagicMock(
+            event_name='test.test')
         message = {'event_type': "foo", 'message_id': "abc"}
         try:
             self.srv._message_to_event(message)
             self.fail("failing save should raise")
         except MyException:
             pass
-
-    def test_extract_when(self):
-        now = timeutils.utcnow()
-        modified = now + datetime.timedelta(minutes=1)
-        timeutils.set_time_override(now)
-
-        body = {"timestamp": str(modified)}
-        self.assertEqual(service.CollectorService._extract_when(body),
-                         modified)
-
-        body = {"_context_timestamp": str(modified)}
-        self.assertEqual(service.CollectorService._extract_when(body),
-                         modified)
-
-        then = now + datetime.timedelta(hours=1)
-        body = {"timestamp": str(modified), "_context_timestamp": str(then)}
-        self.assertEqual(service.CollectorService._extract_when(body),
-                         modified)
-
-        self.assertEqual(service.CollectorService._extract_when({}), now)
